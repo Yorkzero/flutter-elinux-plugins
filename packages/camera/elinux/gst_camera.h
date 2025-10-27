@@ -42,7 +42,8 @@ class GstCamera {
  private:
   struct GstCameraElements {
     GstElement* pipeline;
-    GstElement* camerabin;
+    GstElement* source;
+    GstElement* jpegdec;
     GstElement* video_convert;
     GstElement* video_sink;
     GstElement* output;
@@ -68,8 +69,8 @@ class GstCamera {
   std::unique_ptr<CameraStreamHandler> stream_handler_ = nullptr;
   float max_zoom_level_;
   float min_zoom_level_;
-  float zoom_level_ = 1.0f;
-  int captured_count_ = 0;
+  // float zoom_level_ = 1.0f;
+  // int captured_count_ = 0;
 
   OnNotifyCaptured on_notify_captured_ = nullptr;
 };

@@ -9,7 +9,8 @@
 GstCamera::GstCamera(std::unique_ptr<CameraStreamHandler> handler)
     : stream_handler_(std::move(handler)) {
   gst_.pipeline = nullptr;
-  gst_.camerabin = nullptr;
+  gst_.source = nullptr;
+  gst_.jpegdec = nullptr;
   gst_.video_convert = nullptr;
   gst_.video_sink = nullptr;
   gst_.output = nullptr;
@@ -25,7 +26,9 @@ GstCamera::GstCamera(std::unique_ptr<CameraStreamHandler> handler)
   // Prerolls before getting information from the pipeline.
   Preroll();
 
-  GetZoomMaxMinSize(max_zoom_level_, min_zoom_level_);
+  // Note: v4l2src supports digital zoom (0-3)
+  max_zoom_level_ = 3.0;
+  min_zoom_level_ = 0.0;
 }
 
 GstCamera::~GstCamera() {
@@ -78,35 +81,39 @@ bool GstCamera::Stop() {
 }
 
 void GstCamera::TakePicture(OnNotifyCaptured on_notify_captured) {
-  if (!gst_.camerabin) {
-    std::cerr << "Failed to take a picture" << std::endl;
-    return;
-  }
-
+  // Note: v4l2src doesn't have built-in capture capability like camerabin
+  // This would need to be implemented using a separate pipeline or appsink
+  std::cerr << "TakePicture is not supported with v4l2src pipeline" << std::endl;
   on_notify_captured_ = on_notify_captured;
-  std::string filename =
-      g_strdup_printf("captured_%04u.jpg", captured_count_++);
-  g_object_set(gst_.camerabin, "location", filename.c_str(), NULL);
-  g_signal_emit_by_name(gst_.camerabin, "start-capture", NULL);
 }
 
 bool GstCamera::SetZoomLevel(float zoom) {
-  if (zoom_level_ == zoom) {
-    return true;
-  }
-  if (max_zoom_level_ < zoom) {
-    std::cerr << "zoom level(" << zoom << ") is over the max-zoom level("
-              << max_zoom_level_ << ")" << std::endl;
+  if (!gst_.source) {
+    std::cerr << "Source not initialized" << std::endl;
     return false;
   }
-  if (min_zoom_level_ > zoom) {
+  
+  // Clamp zoom level to valid range (0-3 for this camera)
+  if (zoom < min_zoom_level_) {
     std::cerr << "zoom level(" << zoom << ") is under the min-zoom level("
               << min_zoom_level_ << ")" << std::endl;
     return false;
   }
-
-  g_object_set(gst_.camerabin, "zoom", zoom, NULL);
-  zoom_level_ = zoom;
+  if (zoom > max_zoom_level_) {
+    std::cerr << "zoom level(" << zoom << ") is over the max-zoom level("
+              << max_zoom_level_ << ")" << std::endl;
+    return false;
+  }
+  
+  // Set zoom via V4L2 control
+  int zoom_int = static_cast<int>(zoom);
+  g_object_set(gst_.source, "extra-controls", 
+               gst_structure_new("controls", 
+                                "zoom-absolute", G_TYPE_INT, zoom_int, 
+                                NULL), 
+               NULL);
+  
+  std::cout << "Set zoom level to: " << zoom_int << std::endl;
   return true;
 }
 
@@ -121,75 +128,95 @@ const uint8_t* GstCamera::GetPreviewFrameBuffer() {
   return reinterpret_cast<const uint8_t*>(pixels_.get());
 }
 
-// Creats a camra pipeline using camerabin.
-// $ gst-launch-1.0 camerabin viewfinder-sink="videoconvert !
-// video/x-raw,format=RGBA ! fakesink"
+// Creates a camera pipeline using v4l2src with MJPG format for high frame rate.
+// $ gst-launch-1.0 v4l2src device=/dev/video34 ! image/jpeg,width=1920,height=1080,framerate=30/1 !
+// jpegdec ! videoconvert ! video/x-raw,format=RGBA ! fakesink
 bool GstCamera::CreatePipeline() {
   gst_.pipeline = gst_pipeline_new("pipeline");
   if (!gst_.pipeline) {
     std::cerr << "Failed to create a pipeline" << std::endl;
     return false;
   }
-  gst_.camerabin = gst_element_factory_make("camerabin", "camerabin");
-  if (!gst_.camerabin) {
-    std::cerr << "Failed to create a source" << std::endl;
+  
+  // Create v4l2src as video source
+  gst_.source = gst_element_factory_make("v4l2src", "source");
+  if (!gst_.source) {
+    std::cerr << "Failed to create v4l2src" << std::endl;
     return false;
   }
+  
+  // Set the device to /dev/video34
+  g_object_set(gst_.source, "device", "/dev/video34", NULL);
+  
+  // Create jpegdec to decode MJPG stream
+  gst_.jpegdec = gst_element_factory_make("jpegdec", "jpegdec");
+  if (!gst_.jpegdec) {
+    std::cerr << "Failed to create jpegdec" << std::endl;
+    return false;
+  }
+  
   gst_.video_convert = gst_element_factory_make("videoconvert", "videoconvert");
   if (!gst_.video_convert) {
     std::cerr << "Failed to create a videoconvert" << std::endl;
     return false;
   }
+  
   gst_.video_sink = gst_element_factory_make("fakesink", "videosink");
   if (!gst_.video_sink) {
     std::cerr << "Failed to create a videosink" << std::endl;
     return false;
   }
-  gst_.output = gst_bin_new("output");
-  if (!gst_.output) {
-    std::cerr << "Failed to create an output" << std::endl;
-    return false;
-  }
+  
   gst_.bus = gst_pipeline_get_bus(GST_PIPELINE(gst_.pipeline));
   if (!gst_.bus) {
     std::cerr << "Failed to create a bus" << std::endl;
     return false;
   }
-  gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this,
-                           NULL);
+  gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this, NULL);
 
   // Sets properties to fakesink to get the callback of a decoded frame.
   g_object_set(G_OBJECT(gst_.video_sink), "sync", TRUE, "qos", FALSE, NULL);
   g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", TRUE, NULL);
   g_signal_connect(G_OBJECT(gst_.video_sink), "handoff",
                    G_CALLBACK(HandoffHandler), this);
-  gst_bin_add_many(GST_BIN(gst_.output), gst_.video_convert, gst_.video_sink,
-                   NULL);
 
-  // Adds caps to the converter to convert the color format to RGBA.
-  auto* caps = gst_caps_from_string("video/x-raw,format=RGBA");
-  auto link_ok =
-      gst_element_link_filtered(gst_.video_convert, gst_.video_sink, caps);
-  gst_caps_unref(caps);
-  if (!link_ok) {
-    std::cerr << "Failed to link elements" << std::endl;
+  // Add all elements to the pipeline
+  gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.source, gst_.jpegdec, 
+                   gst_.video_convert, gst_.video_sink, NULL);
+
+  // Set caps for MJPG format @ 1920x1080 30fps
+  auto* mjpeg_caps = gst_caps_from_string("image/jpeg,width=1920,height=1080,framerate=30/1");
+  
+  // Link: v4l2src -> jpegdec (with MJPG caps filter)
+  if (!gst_element_link_filtered(gst_.source, gst_.jpegdec, mjpeg_caps)) {
+    std::cerr << "Failed to link source to jpegdec" << std::endl;
+    gst_caps_unref(mjpeg_caps);
     return false;
   }
-
-  auto* sinkpad = gst_element_get_static_pad(gst_.video_convert, "sink");
-  auto* ghost_sinkpad = gst_ghost_pad_new("sink", sinkpad);
-  gst_pad_set_active(ghost_sinkpad, TRUE);
-  gst_element_add_pad(gst_.output, ghost_sinkpad);
-
-  // Sets properties to camerabin.
-  g_object_set(gst_.camerabin, "viewfinder-sink", gst_.output, NULL);
-  gst_bin_add_many(GST_BIN(gst_.pipeline), gst_.camerabin, NULL);
+  gst_caps_unref(mjpeg_caps);
+  
+  // Link: jpegdec -> videoconvert
+  if (!gst_element_link(gst_.jpegdec, gst_.video_convert)) {
+    std::cerr << "Failed to link jpegdec to videoconvert" << std::endl;
+    return false;
+  }
+  
+  // Adds caps to the converter to convert the color format to RGBA.
+  auto* rgba_caps = gst_caps_from_string("video/x-raw,format=RGBA");
+  
+  // Link: videoconvert -> fakesink (with RGBA caps filter)
+  auto link_ok = gst_element_link_filtered(gst_.video_convert, gst_.video_sink, rgba_caps);
+  gst_caps_unref(rgba_caps);
+  if (!link_ok) {
+    std::cerr << "Failed to link videoconvert to sink" << std::endl;
+    return false;
+  }
 
   return true;
 }
 
 void GstCamera::Preroll() {
-  if (!gst_.camerabin) {
+  if (!gst_.source) {
     return;
   }
 
@@ -234,12 +261,12 @@ void GstCamera::DestroyPipeline() {
     gst_.pipeline = nullptr;
   }
 
-  if (gst_.camerabin) {
-    gst_.camerabin = nullptr;
+  if (gst_.source) {
+    gst_.source = nullptr;
   }
 
-  if (gst_.output) {
-    gst_.output = nullptr;
+  if (gst_.jpegdec) {
+    gst_.jpegdec = nullptr;
   }
 
   if (gst_.video_sink) {
@@ -252,13 +279,9 @@ void GstCamera::DestroyPipeline() {
 }
 
 void GstCamera::GetZoomMaxMinSize(float& max, float& min) {
-  if (!gst_.pipeline || !gst_.camerabin) {
-    std::cerr << "The pileline hasn't initialized yet.";
-    return;
-  }
-
-  g_object_get(gst_.camerabin, "max-zoom", &max, NULL);
-  min = 1.0;
+  // v4l2src supports digital zoom via V4L2 controls (0-3 for this camera)
+  max = 3.0;
+  min = 0.0;
 }
 
 // static
